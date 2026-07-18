@@ -150,6 +150,16 @@ Absent optional fields are omitted, never serialized as `null`.
 
 **Integrity limits.** The chain makes accidental corruption, truncation and naive edits evident. It is **not** proof against an adversary who can rewrite the whole file: the chain carries no signature and no external anchor in v0.1, so it can be recomputed by anyone with write access. If you need stronger guarantees, archive the final line's hash — or the whole ledger — outside the workspace, at a time you trust.
 
+## Threat model
+
+Stated explicitly, as a stop rule — any extension of this boundary requires a spec version bump, not another patch (§19).
+
+**In scope (v0.1): a non-cooperative command.** The observed process may be buggy, messy, spawn descendants, leave symlinks around, or race the snapshot. Observation and writing are descriptor-based (`openat`-style traversal, `O_NOFOLLOW`, held `.stone` descriptors, process groups) precisely so that none of this can lead reads or writes outside the workspace.
+
+**Out of scope (v0.1): a hostile process with the same UID that deliberately sabotages the observer.** Such a process can always delete `.stone`, kill Cornerstone, detach from the process group, plant special files, or rewrite the ledger after the fact. Resisting that requires a privilege boundary — a separate user, a daemon, a sandbox — which is an architectural decision for a future version, not another `O_NOFOLLOW` variant.
+
+Known edges inside the out-of-scope zone, documented as non-blocking backlog: an `index.jsonl` pre-created as a **hard link** to an external file (`O_NOFOLLOW` does not defend against hard links); an `index.jsonl` pre-created as a **FIFO** (the append open can block); a `.stone` renamed mid-session leaves a correct but **orphaned ledger** (writes stay in the real, renamed directory; the CLI then no longer finds them under `.stone`) while the session still reports its outcome normally.
+
 **Paths.** The ledger contains only paths relative to the workspace root; the absolute workspace path is never written. The command line is recorded exactly as given: if it contains absolute paths or secrets, they enter the ledger.
 
 **Index.** `.stone/index.jsonl` is append-only, one line per session (`id`, `started_at`, `outcome`). It backs `latest` resolution and `stone list`.

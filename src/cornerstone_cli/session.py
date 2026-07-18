@@ -70,6 +70,23 @@ def _pump(stream, sink, buffer: _TailBuffer) -> None:
     stream.close()
 
 
+def _wait_for_descendants(pgid: int) -> None:
+    """Block until the observed process group is empty.
+
+    Descendants that outlive the immediate child are part of the execution:
+    the final snapshot must not run while they can still write. A group
+    member that never exits keeps the session open until interrupted.
+    """
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass  # a group member exists but is not ours to signal: still running
+        time.sleep(0.05)
+
+
 def _write_log(path: Path, buffer: _TailBuffer) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as fh:
@@ -129,11 +146,16 @@ def _run_locked(
     if capture_output:
         popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
     try:
-        process = subprocess.Popen(command, cwd=root, **popen_kwargs)
+        # The command gets its own process group so that descendants stay
+        # observable: the session ends when the whole group has exited, not
+        # when the immediate child does. A process that detaches from the
+        # group (setsid, double fork) still escapes the observation window.
+        process = subprocess.Popen(command, cwd=root, start_new_session=True, **popen_kwargs)
     except FileNotFoundError:
         raise CommandError(f"command not found: {command[0]}", 127) from None
     except PermissionError:
         raise CommandError(f"command not executable: {command[0]}", 126) from None
+    pgid = process.pid
 
     stdout_buffer = stderr_buffer = None
     pumps: list[threading.Thread] = []
@@ -147,27 +169,31 @@ def _run_locked(
         for pump in pumps:
             pump.start()
 
-    # §11: on interruption, forward the signal to the child and wait for it.
+    # §11: on interruption, forward the signal to the whole group and wait.
+    # The child no longer shares the terminal's process group, so forwarding
+    # is what delivers Ctrl-C to it and to its descendants.
     interrupted = False
 
     def _forward(signum, _frame):
         nonlocal interrupted
         interrupted = True
         try:
-            process.send_signal(signum)
+            os.killpg(pgid, signum)
         except OSError:
             pass
 
     previous_handlers = {sig: signal.signal(sig, _forward) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         returncode = process.wait()
+        _wait_for_descendants(pgid)
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     for pump in pumps:
         pump.join(timeout=5)
 
-    # §5 step 5: exit code and duration.
+    # §5 step 5: exit code and duration. The exit code is the immediate
+    # child's; the duration covers the whole process group.
     duration = time.monotonic() - clock_start
     exit_code = returncode if returncode >= 0 else 128 - returncode
 

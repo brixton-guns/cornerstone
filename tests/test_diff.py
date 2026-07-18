@@ -61,6 +61,17 @@ def test_rename_inferred_on_unique_hash():
     assert event["path"] == "docs/notes.txt"
 
 
+def test_rename_not_inferred_when_permissions_differ():
+    # file.renamed has no mode fields (§10): pairing would lose the 0644→0600 delta.
+    before = {"f.txt": file_entry(H["a"], mode="0644")}
+    after = {"g.txt": file_entry(H["a"], mode="0600")}
+    events = diff_events(before, after)
+    assert [e["type"] for e in events] == ["file.created", "file.deleted"]
+    created = events[0]
+    assert created["path"] == "g.txt"
+    assert created["mode"] == "0600"
+
+
 def test_empty_files_are_never_paired_as_renames():
     empty = file_entry(H["a"], size=0)
     events = diff_events({"old.empty": empty}, {"new.empty": empty})

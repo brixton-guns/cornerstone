@@ -124,6 +124,61 @@ def test_verify_detects_tampered_ledger(workspace, capsys):
     assert "NOT intact" in capsys.readouterr().out
 
 
+def test_descendants_are_awaited_before_the_final_snapshot(workspace):
+    script = "( sleep 0.3; echo late > late.txt ) & exit 0"
+    assert main(["run", "--", "/bin/sh", "-c", script]) == 0
+    records = read_ledger_lines(workspace)
+    assert ("file.created", "late.txt") in {(r["type"], r.get("path")) for r in records[1:-1]}
+    assert records[-1]["duration_s"] >= 0.3
+
+
+def test_rename_with_chmod_is_recorded_as_delete_plus_create(workspace):
+    (workspace / "f.txt").write_text("some content")
+    os.chmod(workspace / "f.txt", 0o644)
+    assert main(["run", "--", "/bin/sh", "-c", "mv f.txt g.txt; chmod 600 g.txt"]) == 0
+    records = read_ledger_lines(workspace)
+    events = {r["type"]: r for r in records[1:-1]}
+    assert set(events) == {"file.created", "file.deleted"}
+    assert events["file.created"]["path"] == "g.txt"
+    assert events["file.created"]["mode"] == "0600"
+    assert events["file.deleted"]["path"] == "f.txt"
+
+
+def test_show_refuses_a_tampered_ledger(workspace, capsys):
+    assert main(["run", "--", "/bin/sh", "-c", "echo x > x.txt"]) == 0
+    capsys.readouterr()
+    session_id = json.loads((workspace / ".stone" / "index.jsonl").read_text().splitlines()[-1])["id"]
+    ledger = workspace / ".stone" / "sessions" / session_id / "events.jsonl"
+    ledger.write_bytes(ledger.read_bytes().replace(b"x.txt", b"y.txt"))
+
+    assert main(["show", "latest"]) == 1
+    assert "NOT intact" in capsys.readouterr().out
+
+
+def test_verify_detects_a_truncated_ledger(workspace, capsys):
+    assert main(["run", "--", "/bin/sh", "-c", "echo x > x.txt"]) == 0
+    capsys.readouterr()
+    session_id = json.loads((workspace / ".stone" / "index.jsonl").read_text().splitlines()[-1])["id"]
+    ledger = workspace / ".stone" / "sessions" / session_id / "events.jsonl"
+    ledger.write_bytes(ledger.read_bytes().split(b"\n")[0] + b"\n")
+
+    assert main(["verify", "latest"]) == 1
+    assert "NOT intact" in capsys.readouterr().out
+
+
+def test_verify_detects_a_ledger_copied_under_another_session_id(workspace, capsys):
+    import shutil
+
+    assert main(["run", "--", "/bin/sh", "-c", "echo x > x.txt"]) == 0
+    capsys.readouterr()
+    session_id = json.loads((workspace / ".stone" / "index.jsonl").read_text().splitlines()[-1])["id"]
+    fake_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    shutil.copytree(workspace / ".stone" / "sessions" / session_id, workspace / ".stone" / "sessions" / fake_id)
+
+    assert main(["verify", fake_id]) == 1
+    assert "NOT intact" in capsys.readouterr().out
+
+
 def test_latest_without_sessions_fails_explicitly(workspace, capsys):
     assert main(["show", "latest"]) == 1
     assert "no sessions" in capsys.readouterr().err

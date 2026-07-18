@@ -7,6 +7,7 @@ observed universe, like directories (§6, §14).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat as stat_module
@@ -34,8 +35,12 @@ def _mode_string(st_mode: int) -> str:
 
 
 def _hash_file(path: str) -> str:
+    # O_NOFOLLOW closes the TOCTOU window between classifying the entry and
+    # opening it: a path swapped for a symlink in between raises ELOOP instead
+    # of being followed outside the workspace.
     digest = hashlib.sha256()
-    with open(path, "rb", buffering=0) as fh:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(fd, "rb", buffering=0) as fh:
         while chunk := fh.read(_CHUNK_SIZE):
             digest.update(chunk)
     return digest.hexdigest()
@@ -72,21 +77,34 @@ def _scan(dir_path: str, rel_prefix: str, ignore: tuple[str, ...], entries: dict
             continue
         try:
             if child.is_symlink():
-                st = child.stat(follow_symlinks=False)
-                try:
-                    target = os.readlink(child.path)
-                except OSError:
-                    target = None
-                digest = hashlib.sha256((target or "").encode("utf-8", "surrogateescape")).hexdigest()
-                entries[rel_path] = Entry("symlink", digest, st.st_size, _mode_string(st.st_mode), target)
+                _record_symlink(child.path, rel_path, entries)
             elif child.is_dir(follow_symlinks=False):
                 _scan(child.path, rel_path + "/", ignore, entries)
             elif child.is_file(follow_symlinks=False):
+                try:
+                    digest = _hash_file(child.path)
+                except OSError as exc:
+                    if exc.errno != errno.ELOOP:
+                        raise
+                    # Swapped for a symlink after being listed as a file:
+                    # record what the path is now, without ever following it.
+                    _record_symlink(child.path, rel_path, entries)
+                    continue
                 st = child.stat(follow_symlinks=False)
-                entries[rel_path] = Entry("file", _hash_file(child.path), st.st_size, _mode_string(st.st_mode))
+                entries[rel_path] = Entry("file", digest, st.st_size, _mode_string(st.st_mode))
         except FileNotFoundError:
             continue  # vanished between listing and reading: no persistent observable state
         except SnapshotError:
             raise
         except OSError as exc:
             raise SnapshotError(f"cannot read {rel_path}: {exc}") from exc
+
+
+def _record_symlink(path: str, rel_path: str, entries: dict[str, Entry]) -> None:
+    st = os.lstat(path)
+    try:
+        target = os.readlink(path)
+    except OSError:
+        target = None
+    digest = hashlib.sha256((target or "").encode("utf-8", "surrogateescape")).hexdigest()
+    entries[rel_path] = Entry("symlink", digest, st.st_size, _mode_string(st.st_mode), target)

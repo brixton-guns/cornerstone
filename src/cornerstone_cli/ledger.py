@@ -43,8 +43,35 @@ def read_ledger(path: Path) -> list[dict]:
     return [json.loads(line) for line in raw.decode("utf-8").splitlines() if line]
 
 
+EVENT_TYPES = ("file.created", "file.deleted", "file.metadata_modified", "file.modified", "file.renamed")
+OUTCOMES = ("success", "failed", "interrupted", "incomplete")
+
+_REQUIRED_FIELDS = {
+    "session.started": {"actor", "command", "id", "prev", "spec", "ts", "type"},
+    "file.created": {"entry_type", "hash", "path", "prev", "size", "ts", "type"},
+    "file.deleted": {"entry_type", "hash_before", "path", "prev", "ts", "type"},
+    "file.modified": {
+        "entry_type_after", "entry_type_before", "hash_after", "hash_before",
+        "path", "prev", "size_after", "size_before", "ts", "type",
+    },
+    "file.metadata_modified": {"mode_after", "mode_before", "path", "prev", "ts", "type"},
+    "file.renamed": {"hash", "path", "path_before", "prev", "size", "ts", "type"},
+    "session.finished": {"duration_s", "exit_code", "outcome", "prev", "ts", "type"},
+}
+_OPTIONAL_FIELDS = {
+    "file.created": {"mode", "target"},
+    "file.modified": {"mode_after", "mode_before"},
+}
+
+
 def verify_ledger(path: Path) -> int:
-    """Recompute the whole hash chain; return the record count or raise LedgerError."""
+    """Recompute the whole hash chain and validate the ledger structure (§10).
+
+    Chain verification alone cannot detect truncation from the end, so the
+    structure is checked too: session.started first, session.finished last,
+    known event types with their required fields, one event per path.
+    Returns the record count or raises LedgerError.
+    """
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -55,8 +82,8 @@ def verify_ledger(path: Path) -> int:
         raise LedgerError("last record is not newline-terminated")
 
     prev = GENESIS
-    lines = raw[:-1].split(b"\n")
-    for number, line in enumerate(lines, start=1):
+    records: list[dict] = []
+    for number, line in enumerate(raw[:-1].split(b"\n"), start=1):
         try:
             record = json.loads(line)
         except ValueError as exc:
@@ -64,4 +91,47 @@ def verify_ledger(path: Path) -> int:
         if not isinstance(record, dict) or record.get("prev") != prev:
             raise LedgerError(f"record {number} does not match the hash chain")
         prev = hashlib.sha256(line).hexdigest()
-    return len(lines)
+        records.append(record)
+
+    _verify_structure(records)
+    return len(records)
+
+
+def _verify_structure(records: list[dict]) -> None:
+    if len(records) < 2:
+        raise LedgerError("ledger must contain at least session.started and session.finished")
+    if records[0].get("type") != "session.started":
+        raise LedgerError("first record is not session.started")
+    if records[-1].get("type") != "session.finished":
+        raise LedgerError("last record is not session.finished")
+
+    for number, record in enumerate(records, start=1):
+        record_type = record.get("type")
+        if 1 < number < len(records) and record_type not in EVENT_TYPES:
+            raise LedgerError(f"record {number} has unexpected type {record_type!r}")
+        required = _REQUIRED_FIELDS[record_type]
+        allowed = required | _OPTIONAL_FIELDS.get(record_type, set())
+        missing = required - record.keys()
+        if missing:
+            raise LedgerError(f"record {number} is missing fields: {', '.join(sorted(missing))}")
+        unknown = record.keys() - allowed
+        if unknown:
+            raise LedgerError(f"record {number} has unknown fields: {', '.join(sorted(unknown))}")
+
+    started, finished = records[0], records[-1]
+    if started.get("spec") != "0.1":
+        raise LedgerError(f"unsupported spec version: {started.get('spec')!r}")
+    if not isinstance(started.get("command"), list):
+        raise LedgerError("session.started `command` is not an argv list")
+    if finished.get("outcome") not in OUTCOMES:
+        raise LedgerError(f"unknown outcome: {finished.get('outcome')!r}")
+    if finished["outcome"] == "incomplete" and len(records) > 2:
+        raise LedgerError("an incomplete session must not contain events")
+
+    subjects: list[str] = []
+    for record in records[1:-1]:
+        subjects.append(record["path"])
+        if "path_before" in record:
+            subjects.append(record["path_before"])
+    if len(subjects) != len(set(subjects)):
+        raise LedgerError("a path is the subject of more than one event")

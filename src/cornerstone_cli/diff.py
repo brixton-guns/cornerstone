@@ -26,8 +26,13 @@ def diff_events(before: dict[str, Entry], after: dict[str, Entry]) -> list[dict]
     for key, old_paths in deleted_by_key.items():
         new_paths = created_by_key.get(key, [])
         if len(old_paths) == 1 and len(new_paths) == 1:
+            old_entry = before[old_paths[0]]
             entry = after[new_paths[0]]
-            if entry.size > 0:
+            # file.renamed carries no permission fields (§10): pairing a rename
+            # whose mode also changed would silently drop that delta, so such a
+            # pair is recorded as distinct file.deleted and file.created events.
+            modes_match = old_entry.mode is None or entry.mode is None or old_entry.mode == entry.mode
+            if entry.size > 0 and modes_match:
                 events.append(
                     {
                         "type": "file.renamed",

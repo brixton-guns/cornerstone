@@ -10,9 +10,29 @@ import pytest
 
 from cornerstone_cli._ulid import ulid
 from cornerstone_cli.ledger import GENESIS, LedgerError, canonical_line, chain_records, verify_ledger, write_ledger
-from cornerstone_cli.snapshot import Entry, SnapshotError, take_snapshot
+from cornerstone_cli.snapshot import Entry, SnapshotError, _hash_file, take_snapshot
 
 IGNORE = (".stone/", ".git/")
+
+TS = "2026-07-18T00:00:00Z"
+
+
+def valid_records(events=None):
+    """A minimal structurally valid session: started, optional events, finished."""
+    started = {
+        "type": "session.started",
+        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor": "test",
+        "command": ["true"],
+        "spec": "0.1",
+        "ts": TS,
+    }
+    finished = {"type": "session.finished", "outcome": "success", "exit_code": 0, "duration_s": 0.5, "ts": TS}
+    return [started, *(events or []), finished]
+
+
+def created_event(path="a.txt"):
+    return {"type": "file.created", "path": path, "entry_type": "file", "hash": "0" * 64, "size": 1, "mode": "0644", "ts": TS}
 
 
 def test_ulid_shape_and_time_ordering():
@@ -38,13 +58,54 @@ def test_chain_records_links_by_sha256():
 
 def test_verify_ledger_detects_tampering(tmp_path):
     path = tmp_path / "events.jsonl"
-    write_ledger(path, [{"type": "session.started"}, {"n": 1}, {"type": "session.finished"}])
+    write_ledger(path, valid_records([created_event()]))
     assert verify_ledger(path) == 3
 
     raw = path.read_bytes()
-    path.write_bytes(raw.replace(b'"n":1', b'"n":2'))
+    path.write_bytes(raw.replace(b'"size":1', b'"size":2'))
     with pytest.raises(LedgerError):
         verify_ledger(path)
+
+
+def test_verify_ledger_detects_truncation(tmp_path):
+    path = tmp_path / "events.jsonl"
+    write_ledger(path, valid_records([created_event()]))
+    first_line = path.read_bytes().split(b"\n")[0] + b"\n"
+    path.write_bytes(first_line)
+    with pytest.raises(LedgerError, match="session.finished"):
+        verify_ledger(path)
+
+
+def test_verify_ledger_rejects_missing_required_fields(tmp_path):
+    path = tmp_path / "events.jsonl"
+    records = valid_records()
+    del records[0]["actor"]
+    write_ledger(path, records)
+    with pytest.raises(LedgerError, match="actor"):
+        verify_ledger(path)
+
+
+def test_verify_ledger_rejects_duplicate_path_subjects(tmp_path):
+    path = tmp_path / "events.jsonl"
+    write_ledger(path, valid_records([created_event("same.txt"), created_event("same.txt")]))
+    with pytest.raises(LedgerError, match="more than one event"):
+        verify_ledger(path)
+
+
+def test_verify_ledger_rejects_events_in_incomplete_sessions(tmp_path):
+    path = tmp_path / "events.jsonl"
+    records = valid_records([created_event()])
+    records[-1]["outcome"] = "incomplete"
+    write_ledger(path, records)
+    with pytest.raises(LedgerError, match="incomplete"):
+        verify_ledger(path)
+
+
+def test_hash_file_refuses_symlinks(tmp_path):
+    (tmp_path / "real.txt").write_text("content")
+    os.symlink("real.txt", tmp_path / "link")
+    with pytest.raises(OSError):
+        _hash_file(str(tmp_path / "link"))
 
 
 def test_snapshot_observes_files_and_symlinks(tmp_path):

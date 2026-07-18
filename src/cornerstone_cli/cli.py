@@ -130,12 +130,22 @@ def _resolve(stone_dir: Path, reference: str) -> str | None:
     return max(rows, key=lambda row: (row["started_at"], row["id"]))["id"]
 
 
-def _ledger_path(stone_dir: Path, session_id: str) -> Path | None:
+def _verified_records(stone_dir: Path, session_id: str) -> list[dict] | None:
+    """Load a session ledger only after full verification (chain + structure + id)."""
     path = stone_dir / "sessions" / session_id / "events.jsonl"
     if not path.is_file():
         print(f"stone: no ledger for session {session_id}", file=sys.stderr)
         return None
-    return path
+    try:
+        verify_ledger(path)
+    except LedgerError as exc:
+        print(f"Ledger NOT intact: {exc}")
+        return None
+    records = read_ledger(path)
+    if records[0].get("id") != session_id:
+        print(f"Ledger NOT intact: it belongs to session {records[0].get('id')!r}, not {session_id!r}")
+        return None
+    return records
 
 
 def _cmd_show(reference: str) -> int:
@@ -143,10 +153,10 @@ def _cmd_show(reference: str) -> int:
     session_id = _resolve(stone_dir, reference)
     if session_id is None:
         return 1
-    path = _ledger_path(stone_dir, session_id)
-    if path is None:
+    records = _verified_records(stone_dir, session_id)
+    if records is None:
         return 1
-    print(render_summary(read_ledger(path)))
+    print(render_summary(records))
     return 0
 
 
@@ -155,15 +165,10 @@ def _cmd_verify(reference: str) -> int:
     session_id = _resolve(stone_dir, reference)
     if session_id is None:
         return 1
-    path = _ledger_path(stone_dir, session_id)
-    if path is None:
+    records = _verified_records(stone_dir, session_id)
+    if records is None:
         return 1
-    try:
-        count = verify_ledger(path)
-    except LedgerError as exc:
-        print(f"Ledger NOT intact: {exc}")
-        return 1
-    print(f"Ledger intact: {count} records, hash chain verified.")
+    print(f"Ledger intact: {len(records)} records, hash chain and structure verified.")
     return 0
 
 

@@ -1,6 +1,6 @@
 # Cornerstone
 
-Cornerstone runs a command inside a controlled workspace, compares the state of the workspace before and after the execution, and records the detected net effects in a tamper-evident ledger.
+Cornerstone runs a command inside a controlled workspace, compares the state of the workspace before and after the execution, and records the detected net effects in a hash-chained ledger.
 
 Cornerstone does not necessarily reconstruct the individual actions performed by the process, nor their chronological order.
 
@@ -87,13 +87,15 @@ The final warning is part of the output, by design.
 11. hash-chain verification;
 12. summary presentation.
 
+The command runs in its own process group, and the session waits for the **entire group** to exit before taking the final snapshot: descendants that outlive the immediate child are still inside the observation window, and interruption signals are forwarded to the whole group. Two honest limits remain: a process that detaches from the group (`setsid`, double fork) escapes observation, and a group member that never exits keeps the session open until interrupted. The recorded exit code is the immediate child's; the duration covers the whole group.
+
 An event's position in the ledger reflects the order in which Cornerstone serialized it, not necessarily the order in which the change happened. An event timestamp records when the effect was detected, not when the change occurred. All timestamps are ISO 8601 in UTC.
 
 ## What a snapshot observes
 
 For every file: content (SHA-256), size, entry type (`file` or `symlink`), POSIX permissions when available, and the textual target for symbolic links.
 
-* **Symbolic links are never followed.** A symlink is recorded with its target text; its hash is the SHA-256 of that text. Cornerstone never scans the target's content, so it cannot accidentally leave the workspace or loop through filesystem cycles.
+* **Symbolic links are never followed.** A symlink is recorded with its target text; its hash is the SHA-256 of that text. Cornerstone never scans the target's content, so it cannot accidentally leave the workspace or loop through filesystem cycles. Regular files are opened with `O_NOFOLLOW`, so a path swapped for a symlink while the snapshot runs is recorded as a symlink rather than followed (no TOCTOU escape).
 * **Directories are not observed elements**: they exist implicitly through file paths. Creating or deleting an empty directory is an invisible effect.
 * Owner, group, extended attributes, ACLs and OS-specific metadata are not compared in v0.1.
 * No workspace size limit: snapshot cost grows with the size of the observed workspace.
@@ -116,9 +118,9 @@ For every file: content (SHA-256), size, entry type (`file` or `symlink`), POSIX
 
 ### Rename inference
 
-A rename is inferred only when all of the following hold: a path disappears, a new path appears, the two entries share the same hash, the correspondence is unique, and the file is larger than zero bytes.
+A rename is inferred only when all of the following hold: a path disappears, a new path appears, the two entries share the same hash, the correspondence is unique, the file is larger than zero bytes, and the permissions match (when available on both sides).
 
-Empty files are never paired automatically. When several deleted or created files share the same hash, Cornerstone does not pick a pair arbitrarily: it records distinct `file.deleted` and `file.created` events. An inferred rename represents content equivalence, not verified identity continuity.
+Empty files are never paired automatically. When several deleted or created files share the same hash, Cornerstone does not pick a pair arbitrarily: it records distinct `file.deleted` and `file.created` events. A rename whose permissions also changed is likewise recorded as distinct events: the `file.renamed` payload has no permission fields, and pairing would silently drop that delta. An inferred rename represents content equivalence, not verified identity continuity.
 
 ## The ledger
 
@@ -142,7 +144,9 @@ Format: JSON Lines. Each line is a canonical JSON record — keys sorted alphabe
 
 Absent optional fields are omitted, never serialized as `null`.
 
-**Hash chain.** Every record carries a `prev` field: the SHA-256 hex digest of the previous line's bytes, newline excluded. The first record uses 64 zeros. `stone verify` recomputes the whole chain; any discrepancy makes the ledger non-intact.
+**Hash chain.** Every record carries a `prev` field: the SHA-256 hex digest of the previous line's bytes, newline excluded. The first record uses 64 zeros. `stone verify` recomputes the whole chain **and validates the structure** — `session.started` first, `session.finished` last, known event types with their required fields, at most one event per path, and a ledger that matches the session directory it sits in. Any discrepancy, including truncation, makes the ledger non-intact. `stone show` runs the same verification before rendering and refuses a non-intact ledger.
+
+**Integrity limits.** The chain makes accidental corruption, truncation and naive edits evident. It is **not** proof against an adversary who can rewrite the whole file: the chain carries no signature and no external anchor in v0.1, so it can be recomputed by anyone with write access. If you need stronger guarantees, archive the final line's hash — or the whole ledger — outside the workspace, at a time you trust.
 
 **Paths.** The ledger contains only paths relative to the workspace root; the absolute workspace path is never written. The command line is recorded exactly as given: if it contains absolute paths or secrets, they enter the ledger.
 

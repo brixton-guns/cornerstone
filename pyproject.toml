@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cornerstone-cli"
+version = "0.1.0"
+description = "Run a command in a controlled workspace and record the net observable effects in a hash-chained ledger."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["agents", "audit", "provenance", "snapshot", "filesystem"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: System :: Monitoring",
+]
+
+[project.scripts]
+stone = "cornerstone_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cornerstone_cli"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

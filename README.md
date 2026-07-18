@@ -170,12 +170,14 @@ Known edges inside the out-of-scope zone, documented as non-blocking backlog: an
 stone run [--actor NAME] [--capture-output] -- COMMAND [ARG…]
 stone show   <session_id | latest>
 stone verify <session_id | latest>
+stone attest <session_id | latest>
 stone list
 ```
 
 * `--actor` sets the declared actor; default: `undeclared`. It is a declaration provided by the user, not a verified attribution.
 * `latest` resolves to the session with the most recent start time among the correctly indexed ones; with no sessions, the command fails with an explicit message and a non-zero exit code.
 * `stone list` shows the indexed sessions, most recent first (id, start, actor, outcome).
+* `stone attest` prints a Witness statement for a verified ledger (see below). stdout carries the statement only; errors go to stderr, so the output can be piped as-is.
 * One session per workspace at a time: `.stone/lock` (session id and PID) blocks concurrent runs; a leftover lock from a crashed process must be removed manually.
 * `stone run` propagates the exit code of the observed command, so it can be dropped into pipelines. Internal errors use dedicated codes:
 
@@ -224,6 +226,16 @@ Cornerstone records only the net delta between the two snapshots. Among the thin
 ## Attribution
 
 Every change that happened in the workspace during the session is associated with the session. This association does not prove the change was produced by the observed process: concurrent writers appear in the session's ledger too. The `actor` field is a declared actor, not a verified attribution.
+
+## Witness attestation
+
+`stone attest` bridges the ledger to the Witness protocol (`witness/0.1`): an external authority that accepts a digest and returns an Ed25519-signed receipt with an acceptance time. The command verifies the session ledger with the same checks as `stone verify`, hashes its exact bytes, and prints the canonical `witness.statement/0.1` object binding the session id to the SHA-256 of `events.jsonl`:
+
+```json
+{"artifact":{"byte_scope":"entire-file-including-final-newline","digest":{"algorithm":"sha256","value":"…"},"media_type":"application/vnd.cornerstone.ledger+jsonl"},"statement_version":"witness.statement/0.1","subject":{"session_id":"…","spec_version":"cornerstone/0.1"}}
+```
+
+The ledger is read once: the digest covers exactly the bytes that passed chain and structure verification. The statement itself is only a locally assembled claim — submitting it to an authority, storing the signed receipt, and pinning the authority's public key happen outside of `stone`. A receipt later proves that these exact ledger bytes existed no later than its acceptance time; it does not make the ledger truthful, and a session's outcome is never redefined by Witness availability.
 
 ## Non-goals of v0.1
 

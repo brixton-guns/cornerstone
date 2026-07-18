@@ -71,20 +71,31 @@ _OPTIONAL_FIELDS = {
 }
 
 
+def read_ledger_bytes(path: Path | str, *, dir_fd: int | None = None) -> bytes:
+    """Read the exact ledger bytes, never following a symlink on the final component."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _O_CLOEXEC, dir_fd=dir_fd)
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise LedgerError(f"cannot read ledger: {exc}") from exc
+
+
 def verify_ledger(path: Path | str, *, dir_fd: int | None = None) -> int:
     """Recompute the whole hash chain and validate the ledger structure (§10).
+
+    Returns the record count or raises LedgerError.
+    """
+    return len(verify_ledger_bytes(read_ledger_bytes(path, dir_fd=dir_fd)))
+
+
+def verify_ledger_bytes(raw: bytes) -> list[dict]:
+    """Verify chain and structure of exact ledger bytes; return the parsed records.
 
     Chain verification alone cannot detect truncation from the end, so the
     structure is checked too: session.started first, session.finished last,
     known event types with their required fields, one event per path.
-    Returns the record count or raises LedgerError.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _O_CLOEXEC, dir_fd=dir_fd)
-        with os.fdopen(fd, "rb") as fh:
-            raw = fh.read()
-    except OSError as exc:
-        raise LedgerError(f"cannot read ledger: {exc}") from exc
     if not raw:
         raise LedgerError("ledger is empty")
     if not raw.endswith(b"\n"):
@@ -103,7 +114,7 @@ def verify_ledger(path: Path | str, *, dir_fd: int | None = None) -> int:
         records.append(record)
 
     _verify_structure(records)
-    return len(records)
+    return records
 
 
 def _verify_structure(records: list[dict]) -> None:

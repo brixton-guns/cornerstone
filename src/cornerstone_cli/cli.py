@@ -1,4 +1,4 @@
-"""Command-line interface (spec §16): stone run / show / verify / list."""
+"""Command-line interface (spec §16): stone run / show / verify / attest / list."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .attest import build_statement
 from .config import ConfigError
 from .ledger import LedgerError, read_ledger, verify_ledger
 from .render import render_summary
@@ -27,6 +28,7 @@ usage: stone <command> [...]
   stone run [--actor NAME] [--capture-output] -- COMMAND [ARG...]
   stone show   <session_id | latest>
   stone verify <session_id | latest>
+  stone attest <session_id | latest>
   stone list
 """
 
@@ -68,6 +70,8 @@ def _dispatch(args: list[str]) -> int:
         return _cmd_show(rest[0])
     if command == "verify" and len(rest) == 1:
         return _cmd_verify(rest[0])
+    if command == "attest" and len(rest) == 1:
+        return _cmd_attest(rest[0])
     if command == "list" and not rest:
         return _cmd_list()
     print(USAGE, end="", file=sys.stderr)
@@ -169,6 +173,25 @@ def _cmd_verify(reference: str) -> int:
     if records is None:
         return 1
     print(f"Ledger intact: {len(records)} records, hash chain and structure verified.")
+    return 0
+
+
+def _cmd_attest(reference: str) -> int:
+    """Print the witness/0.1 statement for a session. stdout carries the statement only."""
+    stone_dir = _stone_dir()
+    session_id = _resolve(stone_dir, reference)
+    if session_id is None:
+        return 1
+    path = stone_dir / "sessions" / session_id / "events.jsonl"
+    if not path.is_file():
+        print(f"stone: no ledger for session {session_id}", file=sys.stderr)
+        return 1
+    try:
+        statement = build_statement(path, session_id)
+    except LedgerError as exc:
+        print(f"stone: refusing to attest: {exc}", file=sys.stderr)
+        return 1
+    print(statement)
     return 0
 
 

@@ -10,7 +10,7 @@ import pytest
 
 from cornerstone_cli._ulid import ulid
 from cornerstone_cli.ledger import GENESIS, LedgerError, canonical_line, chain_records, verify_ledger, write_ledger
-from cornerstone_cli.snapshot import Entry, SnapshotError, _hash_file, take_snapshot
+from cornerstone_cli.snapshot import Entry, SnapshotError, _read_regular, take_snapshot
 
 IGNORE = (".stone/", ".git/")
 
@@ -101,11 +101,18 @@ def test_verify_ledger_rejects_events_in_incomplete_sessions(tmp_path):
         verify_ledger(path)
 
 
-def test_hash_file_refuses_symlinks(tmp_path):
+def test_read_regular_refuses_symlinks(tmp_path):
     (tmp_path / "real.txt").write_text("content")
     os.symlink("real.txt", tmp_path / "link")
     with pytest.raises(OSError):
-        _hash_file(str(tmp_path / "link"))
+        _read_regular(str(tmp_path / "link"), None)
+
+
+def test_fifos_are_not_observed_and_do_not_block(tmp_path):
+    os.mkfifo(tmp_path / "pipe")
+    (tmp_path / "seen.txt").write_text("x")
+    snap = take_snapshot(tmp_path, IGNORE)
+    assert set(snap) == {"seen.txt"}
 
 
 def test_snapshot_observes_files_and_symlinks(tmp_path):

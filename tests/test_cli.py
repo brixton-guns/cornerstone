@@ -218,6 +218,16 @@ def test_capture_output_truncation_keeps_the_tail(workspace):
     assert log == b"6789ABCDEF"
 
 
+def test_symlinked_stone_dir_is_refused(workspace, capsys):
+    outside = workspace.parent / f"{workspace.name}-outside-stone"
+    outside.mkdir()
+    os.symlink(str(outside), workspace / ".stone")
+
+    assert main(["run", "--", "true"]) == 97
+    assert "symbolic link" in capsys.readouterr().err
+    assert list(outside.iterdir()) == []  # nothing was written outside the workspace
+
+
 def test_invalid_config_is_a_workspace_error(workspace, capsys):
     config_dir = workspace / ".stone"
     config_dir.mkdir()

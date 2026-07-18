@@ -87,6 +87,8 @@ The final warning is part of the output, by design.
 11. hash-chain verification;
 12. summary presentation.
 
+Validation refuses a `.stone` that is a symbolic link: the lock, the ledger and the index must not be writable through a path that leads outside the workspace.
+
 The command runs in its own process group, and the session waits for the **entire group** to exit before taking the final snapshot: descendants that outlive the immediate child are still inside the observation window, and interruption signals are forwarded to the whole group. Two honest limits remain: a process that detaches from the group (`setsid`, double fork) escapes observation, and a group member that never exits keeps the session open until interrupted. The recorded exit code is the immediate child's; the duration covers the whole group.
 
 An event's position in the ledger reflects the order in which Cornerstone serialized it, not necessarily the order in which the change happened. An event timestamp records when the effect was detected, not when the change occurred. All timestamps are ISO 8601 in UTC.
@@ -95,7 +97,7 @@ An event's position in the ledger reflects the order in which Cornerstone serial
 
 For every file: content (SHA-256), size, entry type (`file` or `symlink`), POSIX permissions when available, and the textual target for symbolic links.
 
-* **Symbolic links are never followed.** A symlink is recorded with its target text; its hash is the SHA-256 of that text. Cornerstone never scans the target's content, so it cannot accidentally leave the workspace or loop through filesystem cycles. Regular files are opened with `O_NOFOLLOW`, so a path swapped for a symlink while the snapshot runs is recorded as a symlink rather than followed (no TOCTOU escape).
+* **Symbolic links are never followed.** A symlink is recorded with its target text; its hash is the SHA-256 of that text. Cornerstone never scans the target's content, so it cannot accidentally leave the workspace or loop through filesystem cycles. The snapshot walks the tree with directory file descriptors (`openat`-style): every directory is opened with `O_DIRECTORY | O_NOFOLLOW` and every file with `O_NOFOLLOW`, both relative to the parent directory's descriptor, and file metadata comes from `fstat` on the same descriptor that was hashed. Swapping **any** path component for a symlink while the snapshot runs cannot lead outside the workspace (no TOCTOU escape, on files or on ancestor directories).
 * **Directories are not observed elements**: they exist implicitly through file paths. Creating or deleting an empty directory is an invisible effect.
 * Owner, group, extended attributes, ACLs and OS-specific metadata are not compared in v0.1.
 * No workspace size limit: snapshot cost grows with the size of the observed workspace.

@@ -98,8 +98,12 @@ def run_session(root: Path, actor: str, command: list[str], capture_output: bool
     # §5 step 1: validation.
     if not root.is_dir():
         raise WorkspaceError(f"workspace is not a directory: {root}")
-    config = load_config(root)
     stone_dir = root / ".stone"
+    # A symlinked .stone would make the lock, the ledger and the index land
+    # outside the workspace; refuse it before reading or writing anything.
+    if stone_dir.is_symlink():
+        raise WorkspaceError(".stone/ is a symbolic link; refusing to write the ledger through it")
+    config = load_config(root)
     try:
         stone_dir.mkdir(exist_ok=True)
     except OSError as exc:

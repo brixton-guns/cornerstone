@@ -87,54 +87,97 @@ def _wait_for_descendants(pgid: int) -> None:
         time.sleep(0.05)
 
 
-def _write_log(path: Path, buffer: _TailBuffer) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _write_log(name: str, buffer: _TailBuffer, dir_fd: int) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC, 0o600, dir_fd=dir_fd)
     with os.fdopen(fd, "wb") as fh:
         fh.write(buffer.data)
 
 
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
 def run_session(root: Path, actor: str, command: list[str], capture_output: bool) -> int:
-    """Run one session end to end; return the process exit code for `stone run`."""
+    """Run one session end to end; return the process exit code for `stone run`.
+
+    Validation opens and HOLDS directory descriptors to the real .stone/ and
+    .stone/sessions/: every later write (lock, ledger, captured output, index)
+    happens relative to those descriptors with O_NOFOLLOW, so swapping either
+    directory for a symlink — before or during the session — cannot redirect
+    writes outside the workspace. The same openat principle the snapshot uses.
+    """
     # §5 step 1: validation.
     if not root.is_dir():
         raise WorkspaceError(f"workspace is not a directory: {root}")
     stone_dir = root / ".stone"
-    # A symlinked .stone would make the lock, the ledger and the index land
-    # outside the workspace; refuse it before reading or writing anything.
     if stone_dir.is_symlink():
         raise WorkspaceError(".stone/ is a symbolic link; refusing to write the ledger through it")
-    config = load_config(root)
     try:
         stone_dir.mkdir(exist_ok=True)
     except OSError as exc:
         raise WorkspaceError(f"cannot create .stone/: {exc}") from exc
+    try:
+        stone_fd = os.open(str(stone_dir), _DIR_FLAGS)
+    except OSError as exc:
+        raise WorkspaceError(f".stone/ cannot be opened as a real directory: {exc}") from exc
 
-    lock_path = stone_dir / "lock"
+    try:
+        config = load_config(stone_fd)
+        try:
+            os.mkdir("sessions", dir_fd=stone_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise WorkspaceError(f"cannot create .stone/sessions/: {exc}") from exc
+        try:
+            sessions_fd = os.open("sessions", _DIR_FLAGS, dir_fd=stone_fd)
+        except OSError as exc:
+            raise WorkspaceError(
+                f".stone/sessions/ is a symbolic link or not a real directory; refusing to write through it ({exc})"
+            ) from exc
+        try:
+            return _locked_session(root, stone_fd, sessions_fd, config, actor, command, capture_output)
+        finally:
+            os.close(sessions_fd)
+    finally:
+        os.close(stone_fd)
+
+
+def _locked_session(
+    root: Path,
+    stone_fd: int,
+    sessions_fd: int,
+    config: Config,
+    actor: str,
+    command: list[str],
+    capture_output: bool,
+) -> int:
     session_id = ulid()  # §5 step 2
     try:
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        lock_fd = os.open("lock", os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_CLOEXEC, 0o600, dir_fd=stone_fd)
     except FileExistsError:
         raise LockError(
-            f"another session holds the lock: {lock_path}\n"
+            f"another session holds the lock: {root / '.stone' / 'lock'}\n"
             "If no session is running, the lock is orphaned: remove the file manually."
         ) from None
     except OSError as exc:
         raise WorkspaceError(f"cannot create lock: {exc}") from exc
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    with os.fdopen(lock_fd, "w", encoding="utf-8") as fh:
         fh.write(canonical_line({"id": session_id, "pid": os.getpid()}) + "\n")
 
     try:
-        return _run_locked(root, stone_dir, config, session_id, actor, command, capture_output)
+        return _run_locked(root, stone_fd, sessions_fd, config, session_id, actor, command, capture_output)
     finally:
         try:
-            lock_path.unlink()
+            os.unlink("lock", dir_fd=stone_fd)
         except OSError:
             pass
 
 
 def _run_locked(
     root: Path,
-    stone_dir: Path,
+    stone_fd: int,
+    sessions_fd: int,
     config: Config,
     session_id: str,
     actor: str,
@@ -237,19 +280,30 @@ def _run_locked(
         }
     )
 
-    # §5 step 10: write the ledger (and captured output, kept out of the ledger).
-    session_dir = stone_dir / "sessions" / session_id
-    session_dir.mkdir(parents=True)
-    ledger_path = session_dir / "events.jsonl"
-    write_ledger(ledger_path, records)
-    if capture_output:
-        _write_log(session_dir / "stdout.log", stdout_buffer)
-        _write_log(session_dir / "stderr.log", stderr_buffer)
+    # §5 step 10: write the ledger (and captured output, kept out of the
+    # ledger), everything relative to the held directory descriptors.
+    try:
+        os.mkdir(session_id, dir_fd=sessions_fd)
+        session_fd = os.open(session_id, _DIR_FLAGS, dir_fd=sessions_fd)
+    except OSError as exc:
+        raise WorkspaceError(f"cannot create the session directory: {exc}") from exc
+    try:
+        write_ledger("events.jsonl", records, dir_fd=session_fd)
+        if capture_output:
+            _write_log("stdout.log", stdout_buffer, session_fd)
+            _write_log("stderr.log", stderr_buffer, session_fd)
+        verify_ledger("events.jsonl", dir_fd=session_fd)  # §5 step 11
+    finally:
+        os.close(session_fd)
 
-    verify_ledger(ledger_path)  # §5 step 11; LedgerError escalates to an internal error
-
-    with open(stone_dir / "index.jsonl", "a", encoding="utf-8") as fh:
-        fh.write(canonical_line({"id": session_id, "started_at": started_ts, "outcome": outcome}) + "\n")
+    index_line = canonical_line({"id": session_id, "started_at": started_ts, "outcome": outcome}) + "\n"
+    index_fd = os.open(
+        "index.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | _O_CLOEXEC, 0o644, dir_fd=stone_fd
+    )
+    try:
+        os.write(index_fd, index_line.encode("utf-8"))
+    finally:
+        os.close(index_fd)
 
     print(render_summary(records))  # §5 step 12
 

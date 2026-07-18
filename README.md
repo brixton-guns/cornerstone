@@ -87,7 +87,7 @@ The final warning is part of the output, by design.
 11. hash-chain verification;
 12. summary presentation.
 
-Validation refuses a `.stone` that is a symbolic link: the lock, the ledger and the index must not be writable through a path that leads outside the workspace.
+Validation refuses a `.stone` that is a symbolic link, and the session then **holds directory descriptors** to the real `.stone/` and `.stone/sessions/` for its entire duration: the lock, the ledger, the captured output and the index are all created relative to those descriptors with `O_NOFOLLOW` — the same `openat` principle the snapshot uses. Swapping `.stone` or `sessions` for a symlink, before or even during the session, cannot redirect Cornerstone's writes outside the workspace.
 
 The command runs in its own process group, and the session waits for the **entire group** to exit before taking the final snapshot: descendants that outlive the immediate child are still inside the observation window, and interruption signals are forwarded to the whole group. Two honest limits remain: a process that detaches from the group (`setsid`, double fork) escapes observation, and a group member that never exits keeps the session open until interrupted. The recorded exit code is the immediate child's; the duration covers the whole group.
 

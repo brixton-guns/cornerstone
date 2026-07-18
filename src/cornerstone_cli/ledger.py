@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 
 GENESIS = "0" * 64
 
@@ -31,8 +34,12 @@ def chain_records(records: list[dict]) -> list[str]:
     return lines
 
 
-def write_ledger(path: Path, records: list[dict]) -> None:
-    path.write_bytes("".join(line + "\n" for line in chain_records(records)).encode("utf-8"))
+def write_ledger(path: Path | str, records: list[dict], *, dir_fd: int | None = None) -> None:
+    """Write a fresh ledger, never following symlinks (O_EXCL | O_NOFOLLOW)."""
+    data = "".join(line + "\n" for line in chain_records(records)).encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC, 0o644, dir_fd=dir_fd)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
 
 
 def read_ledger(path: Path) -> list[dict]:
@@ -64,7 +71,7 @@ _OPTIONAL_FIELDS = {
 }
 
 
-def verify_ledger(path: Path) -> int:
+def verify_ledger(path: Path | str, *, dir_fd: int | None = None) -> int:
     """Recompute the whole hash chain and validate the ledger structure (§10).
 
     Chain verification alone cannot detect truncation from the end, so the
@@ -73,7 +80,9 @@ def verify_ledger(path: Path) -> int:
     Returns the record count or raises LedgerError.
     """
     try:
-        raw = path.read_bytes()
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _O_CLOEXEC, dir_fd=dir_fd)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read()
     except OSError as exc:
         raise LedgerError(f"cannot read ledger: {exc}") from exc
     if not raw:

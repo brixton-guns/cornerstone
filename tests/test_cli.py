@@ -228,6 +228,30 @@ def test_symlinked_stone_dir_is_refused(workspace, capsys):
     assert list(outside.iterdir()) == []  # nothing was written outside the workspace
 
 
+def test_symlinked_sessions_dir_is_refused(workspace, capsys):
+    outside = workspace.parent / f"{workspace.name}-outside-sessions"
+    outside.mkdir()
+    (workspace / ".stone").mkdir()
+    os.symlink(str(outside), workspace / ".stone" / "sessions")
+
+    assert main(["run", "--", "true"]) == 97
+    assert "sessions" in capsys.readouterr().err
+    assert list(outside.iterdir()) == []  # nothing was written outside the workspace
+
+
+def test_stone_swapped_during_the_session_cannot_redirect_writes(workspace, capsys):
+    outside = workspace.parent / f"{workspace.name}-outside-swap"
+    outside.mkdir()
+
+    script = f"mv .stone stone-moved; ln -s {outside} .stone"
+    assert main(["run", "--", "/bin/sh", "-c", script]) == 0
+    capsys.readouterr()
+
+    assert list(outside.iterdir()) == []  # writes followed the held descriptor, not the name
+    moved_sessions = workspace / "stone-moved" / "sessions"
+    assert any(moved_sessions.iterdir())  # the ledger landed in the real directory
+
+
 def test_invalid_config_is_a_workspace_error(workspace, capsys):
     config_dir = workspace / ".stone"
     config_dir.mkdir()

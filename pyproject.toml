@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cornerstone-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Run a command in a controlled workspace and record the net observable effects in a hash-chained ledger."
 readme = "README.md"
 license = "MIT"

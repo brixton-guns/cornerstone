@@ -91,6 +91,24 @@ def test_missing_backend_is_95_with_the_absent_cause(workspace, capsys, monkeypa
 
 
 @confinable
+def test_confinement_preserves_job_control(workspace, capsys):
+    """A confined command must still manage its own children (spec v0.2 §3).
+
+    The only Seatbelt form that would stop the observed process from signaling
+    the observer also stops it from signaling its own descendants: a child then
+    survives kill -KILL, breaking timeouts, cleanup, and toolchains. That form
+    was measured and rejected; this test fails if anyone reintroduces it.
+    """
+    script = (
+        'sh -c "sleep 5; echo survivor > child-survived.txt" & '
+        "CHILD=$!; kill -KILL $CHILD; sleep 1; echo done > parent-ran.txt"
+    )
+    assert main(["run", "--confine", "--", "/bin/sh", "-c", script]) == 0
+    assert (workspace / "parent-ran.txt").exists()
+    assert not (workspace / "child-survived.txt").exists()  # the kill was delivered
+
+
+@confinable
 def test_unconfined_sessions_declare_no_confinement(workspace, capsys):
     assert main(["run", "--", "true"]) == 0
     assert "Confinement: none" in capsys.readouterr().out

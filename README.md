@@ -215,8 +215,15 @@ Before the session starts, a two-stage probe proves the mask works: the
 wrapper must run at all, and a probe write into `.stone/` under the mask must
 fail. Any other outcome aborts with exit `95` — no silent degradation. The
 session ledger records `confinement_backend`, `confinement_profile`, and
-`confinement_signal_scope` (currently always `false`: no backend implements
-signal scoping yet), and the summary declares them.
+`confinement_signal_scope`, and the summary declares them.
+
+`confinement_signal_scope` is always `false` today, and on macOS that is a
+measured decision rather than a missing feature: the only Seatbelt rule that
+stops the observed process from signaling the observer also stops it from
+signaling its own children — a child survives `kill -KILL`, which would break
+timeouts, cleanup, and any toolchain that manages subprocesses. Since killing
+the observer produces absence of proof rather than false proof, that trade is
+not worth making. On Linux, Landlock signal scoping needs kernel 6.12 or later.
 
 Confinement guards the ledger from the observed process. It does not protect
 the observer from same-UID signals, does not restrict reads, and does not

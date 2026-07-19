@@ -302,8 +302,10 @@ def _run_locked(
             "spec": SPEC_VERSION,
             "confinement_backend": backend or "none",
             "confinement_profile": "ledger" if backend else "none",
-            # No backend implements signal scoping yet (Landlock ABI 6 needs
-            # kernel >= 6.12; Seatbelt semantics unverified): honest false.
+            # Always false today, and deliberately so on macOS: the only
+            # Seatbelt form that blocks signals to the observer also blocks
+            # them to the command's own children, breaking job control (spec
+            # v0.2 §3). Landlock signal scoping needs kernel >= 6.12.
             "confinement_signal_scope": False,
             "ts": started_ts,
         }

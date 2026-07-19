@@ -13,12 +13,16 @@ from pathlib import Path
 
 from . import SPEC_VERSION
 from ._ulid import ulid
+from .attest import RECEIPT_FILENAME, AttestationError, build_statement, submit_statement
 from .config import Config, load_config
+from .confine import probe, resolve_backend, wrap_command
 from .diff import diff_events
-from .ledger import canonical_line, verify_ledger, write_ledger
+from .ledger import LedgerError, canonical_line, verify_ledger, write_ledger
 from .render import render_summary
 from .snapshot import SnapshotError, take_snapshot
 
+EXIT_ATTEST = 94
+EXIT_CONFINE = 95
 EXIT_LOCK = 96
 EXIT_WORKSPACE = 97
 EXIT_SNAPSHOT = 98
@@ -97,7 +101,16 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEX
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 
 
-def run_session(root: Path, actor: str, command: list[str], capture_output: bool) -> int:
+def run_session(
+    root: Path,
+    actor: str,
+    command: list[str],
+    capture_output: bool,
+    *,
+    confine: bool = False,
+    attest_url: str | None = None,
+    attest_policy: str = "open",
+) -> int:
     """Run one session end to end; return the process exit code for `stone run`.
 
     Validation opens and HOLDS directory descriptors to the real .stone/ and
@@ -123,6 +136,12 @@ def run_session(root: Path, actor: str, command: list[str], capture_output: bool
 
     try:
         config = load_config(stone_fd)
+        # Spec v0.2 §3: resolve the backend and prove the mask works (probe)
+        # before anything else happens; fail-closed exit 95 is the caller's.
+        backend = None
+        if confine:
+            backend = resolve_backend()
+            probe(backend, stone_dir)
         try:
             os.mkdir("sessions", dir_fd=stone_fd)
         except FileExistsError:
@@ -136,7 +155,10 @@ def run_session(root: Path, actor: str, command: list[str], capture_output: bool
                 f".stone/sessions/ is a symbolic link or not a real directory; refusing to write through it ({exc})"
             ) from exc
         try:
-            return _locked_session(root, stone_fd, sessions_fd, config, actor, command, capture_output)
+            return _locked_session(
+                root, stone_fd, sessions_fd, config, actor, command, capture_output,
+                backend=backend, attest_url=attest_url, attest_policy=attest_policy,
+            )
         finally:
             os.close(sessions_fd)
     finally:
@@ -151,6 +173,10 @@ def _locked_session(
     actor: str,
     command: list[str],
     capture_output: bool,
+    *,
+    backend: str | None,
+    attest_url: str | None,
+    attest_policy: str,
 ) -> int:
     session_id = ulid()  # §5 step 2
     try:
@@ -166,7 +192,10 @@ def _locked_session(
         fh.write(canonical_line({"id": session_id, "pid": os.getpid()}) + "\n")
 
     try:
-        return _run_locked(root, stone_fd, sessions_fd, config, session_id, actor, command, capture_output)
+        return _run_locked(
+            root, stone_fd, sessions_fd, config, session_id, actor, command, capture_output,
+            backend=backend, attest_url=attest_url, attest_policy=attest_policy,
+        )
     finally:
         try:
             os.unlink("lock", dir_fd=stone_fd)
@@ -183,12 +212,18 @@ def _run_locked(
     actor: str,
     command: list[str],
     capture_output: bool,
+    *,
+    backend: str | None,
+    attest_url: str | None,
+    attest_policy: str,
 ) -> int:
     snapshot_before = take_snapshot(root, config.ignore)  # §5 step 3
     started_ts = _utc_now()
     clock_start = time.monotonic()
 
-    # §5 step 4: execution.
+    # §5 step 4: execution. The ledger records the command as given; the
+    # confinement wrapper is the observer's mechanics, not the actor's claim.
+    executed = command if backend is None else wrap_command(backend, root / ".stone", command)
     popen_kwargs: dict = {}
     if capture_output:
         popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
@@ -197,7 +232,7 @@ def _run_locked(
         # observable: the session ends when the whole group has exited, not
         # when the immediate child does. A process that detaches from the
         # group (setsid, double fork) still escapes the observation window.
-        process = subprocess.Popen(command, cwd=root, start_new_session=True, **popen_kwargs)
+        process = subprocess.Popen(executed, cwd=root, start_new_session=True, **popen_kwargs)
     except FileNotFoundError:
         raise CommandError(f"command not found: {command[0]}", 127) from None
     except PermissionError:
@@ -265,6 +300,11 @@ def _run_locked(
             "actor": actor,
             "command": list(command),
             "spec": SPEC_VERSION,
+            "confinement_backend": backend or "none",
+            "confinement_profile": "ledger" if backend else "none",
+            # No backend implements signal scoping yet (Landlock ABI 6 needs
+            # kernel >= 6.12; Seatbelt semantics unverified): honest false.
+            "confinement_signal_scope": False,
             "ts": started_ts,
         }
     ]
@@ -287,12 +327,18 @@ def _run_locked(
         session_fd = os.open(session_id, _DIR_FLAGS, dir_fd=sessions_fd)
     except OSError as exc:
         raise WorkspaceError(f"cannot create the session directory: {exc}") from exc
+    attest_line = None
+    attest_failed = False
     try:
         write_ledger("events.jsonl", records, dir_fd=session_fd)
         if capture_output:
             _write_log("stdout.log", stdout_buffer, session_fd)
             _write_log("stderr.log", stderr_buffer, session_fd)
         verify_ledger("events.jsonl", dir_fd=session_fd)  # §5 step 11
+        if attest_url is not None:
+            # Spec v0.2 §5: attestation happens only after the ledger is
+            # sealed and verified; its failure is declared, never hidden.
+            attest_line, attest_failed = _attest(session_fd, session_id, attest_url)
     finally:
         os.close(session_fd)
 
@@ -306,5 +352,27 @@ def _run_locked(
         os.close(index_fd)
 
     print(render_summary(records))  # §5 step 12
+    if attest_line is not None:
+        print(attest_line)
 
-    return EXIT_SNAPSHOT if outcome == "incomplete" else exit_code
+    if outcome == "incomplete":
+        return EXIT_SNAPSHOT
+    if attest_failed and attest_policy == "strict":
+        return EXIT_ATTEST
+    return exit_code
+
+
+def _attest(session_fd: int, session_id: str, url: str) -> tuple[str, bool]:
+    """Submit the statement and save the receipt; report, never raise."""
+    try:
+        statement = build_statement("events.jsonl", session_id, dir_fd=session_fd)
+        receipt = submit_statement(url, statement)
+        fd = os.open(
+            RECEIPT_FILENAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC, 0o644,
+            dir_fd=session_fd,
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(receipt)
+    except (LedgerError, AttestationError, OSError) as exc:
+        return f"Attestation FAILED: {exc}", True
+    return f"Attestation: receipt accepted and saved as {RECEIPT_FILENAME}", False

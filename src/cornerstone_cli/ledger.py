@@ -52,9 +52,21 @@ def read_ledger(path: Path) -> list[dict]:
 
 EVENT_TYPES = ("file.created", "file.deleted", "file.metadata_modified", "file.modified", "file.renamed")
 OUTCOMES = ("success", "failed", "interrupted", "incomplete")
+CONFINEMENT_BACKENDS = ("userns", "seatbelt", "none")
+CONFINEMENT_PROFILES = ("ledger", "none")
+
+# spec 0.2 adds the confinement declaration to session.started (spec v0.2 §4);
+# both ledger versions remain verifiable, each against its own schema.
+_STARTED_FIELDS_BY_SPEC = {
+    "0.1": {"actor", "command", "id", "prev", "spec", "ts", "type"},
+    "0.2": {
+        "actor", "command", "confinement_backend", "confinement_profile",
+        "confinement_signal_scope", "id", "prev", "spec", "ts", "type",
+    },
+}
 
 _REQUIRED_FIELDS = {
-    "session.started": {"actor", "command", "id", "prev", "spec", "ts", "type"},
+    "session.started": _STARTED_FIELDS_BY_SPEC["0.1"],
     "file.created": {"entry_type", "hash", "path", "prev", "size", "ts", "type"},
     "file.deleted": {"entry_type", "hash_before", "path", "prev", "ts", "type"},
     "file.modified": {
@@ -125,11 +137,18 @@ def _verify_structure(records: list[dict]) -> None:
     if records[-1].get("type") != "session.finished":
         raise LedgerError("last record is not session.finished")
 
+    spec = records[0].get("spec")
+    if spec not in _STARTED_FIELDS_BY_SPEC:
+        raise LedgerError(f"unsupported spec version: {spec!r}")
+
     for number, record in enumerate(records, start=1):
         record_type = record.get("type")
         if 1 < number < len(records) and record_type not in EVENT_TYPES:
             raise LedgerError(f"record {number} has unexpected type {record_type!r}")
-        required = _REQUIRED_FIELDS[record_type]
+        if record_type == "session.started":
+            required = _STARTED_FIELDS_BY_SPEC[spec]
+        else:
+            required = _REQUIRED_FIELDS[record_type]
         allowed = required | _OPTIONAL_FIELDS.get(record_type, set())
         missing = required - record.keys()
         if missing:
@@ -139,10 +158,15 @@ def _verify_structure(records: list[dict]) -> None:
             raise LedgerError(f"record {number} has unknown fields: {', '.join(sorted(unknown))}")
 
     started, finished = records[0], records[-1]
-    if started.get("spec") != "0.1":
-        raise LedgerError(f"unsupported spec version: {started.get('spec')!r}")
     if not isinstance(started.get("command"), list):
         raise LedgerError("session.started `command` is not an argv list")
+    if spec == "0.2":
+        if started.get("confinement_backend") not in CONFINEMENT_BACKENDS:
+            raise LedgerError(f"unknown confinement backend: {started.get('confinement_backend')!r}")
+        if started.get("confinement_profile") not in CONFINEMENT_PROFILES:
+            raise LedgerError(f"unknown confinement profile: {started.get('confinement_profile')!r}")
+        if not isinstance(started.get("confinement_signal_scope"), bool):
+            raise LedgerError("session.started `confinement_signal_scope` is not a boolean")
     if finished.get("outcome") not in OUTCOMES:
         raise LedgerError(f"unknown outcome: {finished.get('outcome')!r}")
     if finished["outcome"] == "incomplete" and len(records) > 2:

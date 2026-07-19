@@ -38,7 +38,7 @@ def test_run_records_all_effect_types(workspace, capsys):
     started, finished = records[0], records[-1]
     assert started["type"] == "session.started"
     assert started["actor"] == "test"
-    assert started["spec"] == "0.1"
+    assert started["spec"] == "0.2"
     assert started["command"] == ["/bin/sh", "-c", script]
     assert finished["type"] == "session.finished"
     assert finished["outcome"] == "success"

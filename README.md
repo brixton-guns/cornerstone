@@ -158,6 +158,8 @@ Stated explicitly, as a stop rule — any extension of this boundary requires a 
 
 **Out of scope (v0.1): a hostile process with the same UID that deliberately sabotages the observer.** Such a process can always delete `.stone`, kill Cornerstone, detach from the process group, plant special files, or rewrite the ledger after the fact. Resisting that requires a privilege boundary — a separate user, a daemon, a sandbox — which is an architectural decision for a future version, not another `O_NOFOLLOW` variant.
 
+**Narrowed by spec v0.2.** With `--confine`, the *observed process itself* can no longer write `.stone/` during the session (see Confinement), and with `--attest` a rewrite after the fact becomes detectable against the signed receipt. Still out of scope, declared: a hostile same-UID process already running before the session, signals from the observed process to the observer (`SIGKILL` produces absence of proof, not false proof), and tampering with the Cornerstone installation itself. Closing those requires the real privilege boundary — the v0.3 candidate.
+
 Known edges inside the out-of-scope zone, documented as non-blocking backlog: an `index.jsonl` pre-created as a **hard link** to an external file (`O_NOFOLLOW` does not defend against hard links); an `index.jsonl` pre-created as a **FIFO** (the append open can block); a `.stone` renamed mid-session leaves a correct but **orphaned ledger** (writes stay in the real, renamed directory; the CLI then no longer finds them under `.stone`) while the session still reports its outcome normally.
 
 **Paths.** The ledger contains only paths relative to the workspace root; the absolute workspace path is never written. The command line is recorded exactly as given: if it contains absolute paths or secrets, they enter the ledger.
@@ -167,10 +169,11 @@ Known edges inside the out-of-scope zone, documented as non-blocking backlog: an
 ## CLI
 
 ```
-stone run [--actor NAME] [--capture-output] -- COMMAND [ARG…]
+stone run [--actor NAME] [--capture-output] [--confine]
+          [--attest URL] [--attest-policy open|strict] -- COMMAND [ARG…]
 stone show   <session_id | latest>
 stone verify <session_id | latest>
-stone attest <session_id | latest>
+stone attest [--url URL] <session_id | latest>
 stone list
 ```
 
@@ -183,10 +186,41 @@ stone list
 
 | Code | Meaning |
 |---|---|
+| `94` | attestation failed under `--attest-policy strict` |
+| `95` | confinement requested but unavailable, or it failed to apply (the message distinguishes the causes) |
 | `96` | active lock |
 | `97` | invalid workspace or configuration |
 | `98` | incomplete snapshot |
 | `99` | internal error |
+
+## Confinement (spec v0.2)
+
+`stone run --confine` denies the observed command — and every descendant,
+including processes that detach from the process group — all write access to
+the real `.stone/` subtree for the whole session, using the platform's
+unprivileged mechanisms:
+
+* **Linux**: an unprivileged user + mount namespace with `.stone/` bind-mounted
+  read-only. The command runs behind a second user namespace mapped to the real
+  UID, so exec drops every capability over the mount namespace holding the
+  mask; nested namespaces created by the command inherit the mask with locked
+  flags and cannot unmount it or remount it writable. On recent Ubuntu the
+  AppArmor restriction on unprivileged user namespaces may make this
+  unavailable out of the box (exit `95` until the administrator allows it).
+* **macOS**: a Seatbelt profile with an explicit deny on the subtree
+  (`sandbox-exec` is deprecated by Apple but has no unprivileged replacement;
+  its removal would surface as exit `95`).
+
+Before the session starts, a two-stage probe proves the mask works: the
+wrapper must run at all, and a probe write into `.stone/` under the mask must
+fail. Any other outcome aborts with exit `95` — no silent degradation. The
+session ledger records `confinement_backend`, `confinement_profile`, and
+`confinement_signal_scope` (currently always `false`: no backend implements
+signal scoping yet), and the summary declares them.
+
+Confinement guards the ledger from the observed process. It does not protect
+the observer from same-UID signals, does not restrict reads, and does not
+replace a real privilege boundary — see the threat model.
 
 ## Session outcomes
 
@@ -229,13 +263,24 @@ Every change that happened in the workspace during the session is associated wit
 
 ## Witness attestation
 
-`stone attest` bridges the ledger to the Witness protocol (`witness/0.1`): an external authority that accepts a digest and returns an Ed25519-signed receipt with an acceptance time. The command verifies the session ledger with the same checks as `stone verify`, hashes its exact bytes, and prints the canonical `witness.statement/0.1` object binding the session id to the SHA-256 of `events.jsonl`:
+`stone attest` bridges the ledger to the Witness protocol: an external authority that accepts a digest and returns an Ed25519-signed receipt with an acceptance time. The command verifies the session ledger with the same checks as `stone verify`, hashes its exact bytes, and emits the canonical statement binding the session id to the SHA-256 of `events.jsonl` (statement version matching the ledger spec: `witness.statement/0.1` for spec-`0.1` ledgers, `witness.statement/0.2` for spec-`0.2`):
 
 ```json
-{"artifact":{"byte_scope":"entire-file-including-final-newline","digest":{"algorithm":"sha256","value":"…"},"media_type":"application/vnd.cornerstone.ledger+jsonl"},"statement_version":"witness.statement/0.1","subject":{"session_id":"…","spec_version":"cornerstone/0.1"}}
+{"artifact":{"byte_scope":"entire-file-including-final-newline","digest":{"algorithm":"sha256","value":"…"},"media_type":"application/vnd.cornerstone.ledger+jsonl"},"statement_version":"witness.statement/0.2","subject":{"session_id":"…","spec_version":"cornerstone/0.2"}}
 ```
 
-The ledger is read once: the digest covers exactly the bytes that passed chain and structure verification. The statement itself is only a locally assembled claim — submitting it to an authority, storing the signed receipt, and pinning the authority's public key happen outside of `stone`. A receipt later proves that these exact ledger bytes existed no later than its acceptance time; it does not make the ledger truthful, and a session's outcome is never redefined by Witness availability.
+The ledger is read once: the digest covers exactly the bytes that passed chain and structure verification.
+
+Attestation is integrated into the session flow: `stone run --attest URL` submits the statement right after the ledger is sealed and verified, saves the receipt as `receipt.json` beside the ledger, and declares the outcome in the summary. With the default `open` policy an attestation failure changes nothing but the declaration; with `--attest-policy strict` it produces exit `94` (the ledger stays intact and verifiable — attestation happens after the seal and can never rewrite it). `stone attest --url URL <session>` does the same for an existing session.
+
+Rules the implementation enforces:
+
+* **receipts are never replaced** — the oldest receipt is the strongest proof (the tightest time bound); a session that already has one is declared, not re-attested;
+* the returned receipt must embed exactly the submitted statement: an authority that alters it is reported, not trusted;
+* plain HTTP to a non-loopback authority is refused;
+* signature verification belongs to `witness verify`: `stone` stays dependency-free, and `stone verify` only reports that a receipt is present.
+
+A receipt proves that these exact ledger bytes existed no later than its acceptance time; it does not make the ledger truthful. `.stone/` is protected by confinement only during the session: copy the receipt outside the workspace right after `run`.
 
 ## Non-goals of v0.1
 

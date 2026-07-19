@@ -24,8 +24,16 @@ def render_summary(records: list[dict]) -> str:
         f"Command: {shlex.join(started['command'])}",
         f"Outcome: {finished['outcome']}",
         f"Duration: {finished['duration_s']:.1f} seconds",
-        "",
     ]
+    if started.get("spec") != "0.1":
+        # Spec v0.2 §4: the summary always declares the effective confinement.
+        backend = started["confinement_backend"]
+        if backend == "none":
+            lines.append("Confinement: none")
+        else:
+            scope = ", signal scope" if started["confinement_signal_scope"] else ""
+            lines.append(f"Confinement: {backend} ({started['confinement_profile']} profile{scope})")
+    lines.append("")
 
     if finished["outcome"] == "incomplete":
         lines.append("The final snapshot could not be completed:")

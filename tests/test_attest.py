@@ -83,6 +83,9 @@ def test_attest_after_a_real_session(workspace, capsys):
     ledger = workspace / ".stone" / "sessions" / session_id / "events.jsonl"
     assert statement["subject"]["session_id"] == session_id
     assert statement["artifact"]["digest"]["value"] == hashlib.sha256(ledger.read_bytes()).hexdigest()
+    # Fresh ledgers are spec 0.2 and map to the 0.2 statement (spec v0.2 §8).
+    assert statement["statement_version"] == "witness.statement/0.2"
+    assert statement["subject"]["spec_version"] == "cornerstone/0.2"
 
 
 def test_attest_refuses_a_tampered_ledger(workspace, capsys):

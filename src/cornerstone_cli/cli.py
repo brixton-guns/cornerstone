@@ -6,11 +6,13 @@ import json
 import sys
 from pathlib import Path
 
-from .attest import build_statement
+from .attest import RECEIPT_FILENAME, AttestationError, build_statement, submit_statement
 from .config import ConfigError
+from .confine import ConfinementError
 from .ledger import LedgerError, read_ledger, verify_ledger
 from .render import render_summary
 from .session import (
+    EXIT_CONFINE,
     EXIT_INTERNAL,
     EXIT_LOCK,
     EXIT_SNAPSHOT,
@@ -25,10 +27,11 @@ from .snapshot import SnapshotError
 USAGE = """\
 usage: stone <command> [...]
 
-  stone run [--actor NAME] [--capture-output] -- COMMAND [ARG...]
+  stone run [--actor NAME] [--capture-output] [--confine]
+            [--attest URL] [--attest-policy open|strict] -- COMMAND [ARG...]
   stone show   <session_id | latest>
   stone verify <session_id | latest>
-  stone attest <session_id | latest>
+  stone attest [--url URL] <session_id | latest>
   stone list
 """
 
@@ -43,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     except LockError as exc:
         print(f"stone: {exc}", file=sys.stderr)
         return EXIT_LOCK
+    except ConfinementError as exc:
+        print(f"stone: {exc}", file=sys.stderr)
+        return EXIT_CONFINE
     except SnapshotError as exc:
         print(f"stone: initial snapshot failed: {exc}", file=sys.stderr)
         return EXIT_SNAPSHOT
@@ -70,8 +76,8 @@ def _dispatch(args: list[str]) -> int:
         return _cmd_show(rest[0])
     if command == "verify" and len(rest) == 1:
         return _cmd_verify(rest[0])
-    if command == "attest" and len(rest) == 1:
-        return _cmd_attest(rest[0])
+    if command == "attest" and rest:
+        return _cmd_attest(rest)
     if command == "list" and not rest:
         return _cmd_list()
     print(USAGE, end="", file=sys.stderr)
@@ -91,6 +97,9 @@ def _cmd_run(args: list[str]) -> int:
 
     actor = "undeclared"
     capture_output = False
+    confine = False
+    attest_url = None
+    attest_policy = "open"
     while options:
         option = options.pop(0)
         if option == "--actor":
@@ -102,11 +111,36 @@ def _cmd_run(args: list[str]) -> int:
             actor = option[len("--actor=") :]
         elif option == "--capture-output":
             capture_output = True
+        elif option == "--confine":
+            confine = True
+        elif option == "--attest":
+            if not options:
+                print("stone run: --attest requires a URL", file=sys.stderr)
+                return 2
+            attest_url = options.pop(0)
+        elif option.startswith("--attest="):
+            attest_url = option[len("--attest=") :]
+        elif option == "--attest-policy":
+            if not options:
+                print("stone run: --attest-policy requires a value", file=sys.stderr)
+                return 2
+            attest_policy = options.pop(0)
+        elif option.startswith("--attest-policy="):
+            attest_policy = option[len("--attest-policy=") :]
         else:
             print(f"stone run: unknown option: {option}", file=sys.stderr)
             return 2
+    if attest_policy not in ("open", "strict"):
+        print(f"stone run: --attest-policy must be open or strict, not {attest_policy!r}", file=sys.stderr)
+        return 2
+    if attest_policy == "strict" and attest_url is None:
+        print("stone run: --attest-policy strict requires --attest URL", file=sys.stderr)
+        return 2
 
-    return run_session(Path.cwd(), actor, command, capture_output)
+    return run_session(
+        Path.cwd(), actor, command, capture_output,
+        confine=confine, attest_url=attest_url, attest_policy=attest_policy,
+    )
 
 
 def _stone_dir() -> Path:
@@ -173,13 +207,39 @@ def _cmd_verify(reference: str) -> int:
     if records is None:
         return 1
     print(f"Ledger intact: {len(records)} records, hash chain and structure verified.")
+    receipt = stone_dir / "sessions" / session_id / RECEIPT_FILENAME
+    if receipt.is_file():
+        # Presence only: receipt signatures are `witness verify`'s job (spec v0.2 §5).
+        print(f"Receipt present: {receipt} (signature not checked here; use `witness verify`).")
     return 0
 
 
-def _cmd_attest(reference: str) -> int:
-    """Print the witness/0.1 statement for a session. stdout carries the statement only."""
+def _cmd_attest(args: list[str]) -> int:
+    """Emit the Witness statement (stdout only) or, with --url, submit it.
+
+    Receipts are never replaced: the oldest receipt is the strongest proof
+    (spec v0.2 §5).
+    """
+    url = None
+    rest: list[str] = []
+    options = list(args)
+    while options:
+        option = options.pop(0)
+        if option == "--url":
+            if not options:
+                print("stone attest: --url requires a value", file=sys.stderr)
+                return 2
+            url = options.pop(0)
+        elif option.startswith("--url="):
+            url = option[len("--url=") :]
+        else:
+            rest.append(option)
+    if len(rest) != 1:
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+
     stone_dir = _stone_dir()
-    session_id = _resolve(stone_dir, reference)
+    session_id = _resolve(stone_dir, rest[0])
     if session_id is None:
         return 1
     path = stone_dir / "sessions" / session_id / "events.jsonl"
@@ -191,7 +251,26 @@ def _cmd_attest(reference: str) -> int:
     except LedgerError as exc:
         print(f"stone: refusing to attest: {exc}", file=sys.stderr)
         return 1
-    print(statement)
+    if url is None:
+        print(statement)
+        return 0
+
+    receipt_path = stone_dir / "sessions" / session_id / RECEIPT_FILENAME
+    if receipt_path.is_file():
+        print(f"Receipt already present: {receipt_path} (receipts are never replaced).")
+        return 0
+    try:
+        receipt = submit_statement(url, statement)
+    except AttestationError as exc:
+        print(f"stone: attestation failed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        with open(receipt_path, "xb") as fh:
+            fh.write(receipt)
+    except OSError as exc:
+        print(f"stone: cannot save the receipt: {exc}", file=sys.stderr)
+        return 1
+    print(f"Attestation: receipt accepted and saved as {receipt_path}")
     return 0
 
 
